@@ -1,16 +1,17 @@
+#![allow(unused)]
+
 mod cli;
 mod errors;
 
-use bitcoin::{ecdsa, Block, EcdsaSighashType};
-use bitcoincore_rpc::{Client, RpcApi};
+use bitcoin::{ecdsa, Amount, Block, EcdsaSighashType};
+use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::Parser as _;
 use cli::Cli;
 use errors::Error;
-use miniscript::bitcoin::{taproot, TapSighashType};
-use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
-use std::thread;
+use miniscript::bitcoin::{amount, taproot, TapSighashType};
+use std::collections::BTreeMap;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self};
 use std::time::Duration;
 
 fn u64_to_spin(step: u64) -> String {
@@ -26,6 +27,143 @@ fn u64_to_spin(step: u64) -> String {
 
 fn erase_line() {
     print!("\x1B[1A\x1B[K");
+}
+
+enum Request {
+    /// Run on this block
+    Run(u64 /* block */),
+    /// Update chain height
+    Height(u64),
+}
+
+enum Response {
+    /// Runner is initialized
+    Initialized(usize /* runner_id */),
+    /// Runner is idle
+    Idle(usize /* runner_id */),
+    /// Runner start processing task
+    // Started(usize /* runner_id */),
+    /// Task finnished
+    Finished(usize /* runner_id */, Vec<String>),
+    /// Runner errored
+    Error(String),
+}
+
+struct Pool {
+    senders: BTreeMap<usize, Sender<Request>>,
+    receiver: Receiver<Response>,
+    runner_sender: Sender<Response>,
+    running_tip: u64,
+    client: Client,
+    runners: usize,
+    url: String,
+    auth: Auth,
+    chain_tip: u64,
+}
+
+impl Pool {
+    fn new(url: String, auth: Auth, start_height: u64, runners: usize) -> Self {
+        let client = Client::new(&url, auth.clone()).unwrap();
+        let (runner_sender, receiver) = mpsc::channel();
+        Self {
+            senders: BTreeMap::new(),
+            receiver,
+            running_tip: start_height,
+            client,
+            runners,
+            runner_sender,
+            url,
+            auth,
+            chain_tip: start_height,
+        }
+    }
+
+    fn init(&mut self) {
+        let block_height = self.client.get_block_count().unwrap();
+        self.chain_tip = block_height;
+        for i in 0..self.runners {
+            let sender = start_runner(
+                i,
+                self.runner_sender.clone(),
+                self.url.clone(),
+                self.auth.clone(),
+                self.running_tip,
+            );
+            if let Ok(Response::Initialized(id)) = self.receiver.recv() {
+                assert!(i == id);
+            } else {
+                panic!("wrong init Response for runner {}", i);
+            }
+            sender.send(Request::Height(block_height)).unwrap();
+            self.senders.insert(i, sender);
+        }
+    }
+
+    fn start(&mut self) {
+        // start all runners on a different block
+        for sender in self.senders.values_mut() {
+            sender.send(Request::Run(self.running_tip)).unwrap();
+            self.running_tip += 1;
+        }
+
+        loop {
+            match self.receiver.recv().unwrap() {
+                Response::Initialized(_) => unreachable!(),
+                Response::Idle(_) => return,
+                Response::Finished(id, items) => {
+                    if self.running_tip < self.chain_tip {
+                        self.senders
+                            .get_mut(&id)
+                            .unwrap()
+                            .send(Request::Run(self.running_tip))
+                            .unwrap();
+                    }
+                    for item in items {
+                        println!("{}", item);
+                    }
+                    if self.running_tip >= self.chain_tip {
+                        return;
+                    } else {
+                        self.running_tip += 1;
+                    }
+                }
+                Response::Error(e) => {
+                    println!("{}", e);
+                }
+            }
+        }
+    }
+}
+
+fn start_runner(
+    runner_id: usize,
+    sender: Sender<Response>,
+    url: String,
+    auth: Auth,
+    chain_tip: u64,
+) -> Sender<Request> {
+    let (pool_sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let client = Client::new(&url, auth).unwrap();
+        let mut runner = BlockRunner::new(client, chain_tip);
+        runner.init().unwrap();
+        sender.send(Response::Initialized(runner_id)).unwrap();
+        loop {
+            if let Ok(resp) = receiver.recv() {
+                match resp {
+                    Request::Run(block_height) => {
+                        let block = runner.fetch_block(block_height).unwrap();
+                        let res = process_block(block, block_height);
+                        sender.send(Response::Finished(runner_id, res)).unwrap();
+                    }
+                    Request::Height(_) => {}
+                }
+            } else {
+                return;
+            }
+        }
+    });
+    pool_sender
 }
 
 struct BlockRunner {
@@ -65,7 +203,7 @@ impl BlockRunner {
                 Ok(height) => self.chain_height = height,
                 Err(e) => println!("Fail to fetch chain height: {}", e),
             }
-            thread::sleep(Duration::from_millis(400));
+            thread::sleep(Duration::from_millis(100));
         }
         Ok(())
     }
@@ -125,76 +263,66 @@ fn main() {
         }
     };
 
-    let rpc = Client::new(url, auth).unwrap();
-    let mut runner = BlockRunner::new(rpc, cli.start());
-    runner.init().unwrap();
+    let max_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let max_cores = if max_cores > 2 { max_cores - 1 } else { 1 };
+    println!("Max cores: {}", max_cores);
+    let mut pool = Pool::new(url.clone(), auth, cli.start(), max_cores);
+    pool.init();
+    pool.start();
+}
 
-    let filename: PathBuf = "all_acp_txs.txt".into();
-    let mut file = File::create(filename).unwrap();
+fn process_block(block: Block, height: u64) -> Vec<String> {
+    let mut output = Vec::<String>::new();
+    let timestamp = block.header.time;
 
-    let mut all_acp_txs = 0usize;
-    let mut can_erase = true;
-
-    loop {
-        let block = runner.next();
-        let timestamp = block.header.time;
-        if can_erase {
-            erase_line();
-        }
-        println!(
-            "processing block {}, {} possible all_acp tx found",
-            runner.fetch_height(),
-            all_acp_txs
-        );
-        can_erase = true;
-        for tx in block.txdata {
-            let mut all_acp_sigs = 0usize;
-            let mut all_sigs = 0usize;
-            for inp in &tx.input {
-                for elmt in inp.witness.into_iter() {
-                    if elmt.len() == 64 || elmt.len() == 65 {
-                        // possibly taproot sig
-                        if let Ok(tap_sig) = taproot::Signature::from_slice(elmt) {
-                            all_sigs += 1;
-                            // if tap_sig.sighash_type == TapSighashType::AllPlusAnyoneCanPay
-                            // || tap_sig.sighash_type == TapSighashType::SinglePlusAnyoneCanPay
-                            // || tap_sig.sighash_type == TapSighashType::NonePlusAnyoneCanPay
-                            if tap_sig.sighash_type == TapSighashType::NonePlusAnyoneCanPay {
-                                all_acp_sigs += 1;
-                            }
+    for tx in block.txdata {
+        let mut inp_spendable = 0usize;
+        for inp in &tx.input {
+            let mut spendable = true;
+            for elmt in inp.witness.into_iter() {
+                if elmt.len() == 64 || elmt.len() == 65 {
+                    // possibly taproot sig
+                    if let Ok(tap_sig) = taproot::Signature::from_slice(elmt) {
+                        // if tap_sig.sighash_type == TapSighashType::AllPlusAnyoneCanPay
+                        // || tap_sig.sighash_type == TapSighashType::SinglePlusAnyoneCanPay
+                        // || tap_sig.sighash_type == TapSighashType::NonePlusAnyoneCanPay
+                        if tap_sig.sighash_type != TapSighashType::NonePlusAnyoneCanPay {
+                            spendable = false;
                         }
-                    } else if elmt.len() >= 70 && elmt.len() <= 72 && elmt[0] == 0x30 {
-                        // possibly ecdsa sig
-                        if let Ok(sig) = ecdsa::Signature::from_slice(elmt) {
-                            all_sigs += 1;
-                            // if sig.hash_ty == EcdsaSighashType::AllPlusAnyoneCanPay
-                            // || sig.hash_ty == EcdsaSighashType::SinglePlusAnyoneCanPay
-                            // || sig.hash_ty == EcdsaSighashType::NonePlusAnyoneCanPay
-                            if sig.hash_ty == EcdsaSighashType::NonePlusAnyoneCanPay {
-                                all_acp_sigs += 1;
-                            }
+                    }
+                } else if elmt.len() >= 70 && elmt.len() <= 72 && elmt[0] == 0x30 {
+                    // possibly ecdsa sig
+                    if let Ok(sig) = ecdsa::Signature::from_slice(elmt) {
+                        // if sig.hash_ty == EcdsaSighashType::AllPlusAnyoneCanPay
+                        // || sig.hash_ty == EcdsaSighashType::SinglePlusAnyoneCanPay
+                        // || sig.hash_ty == EcdsaSighashType::NonePlusAnyoneCanPay
+                        if sig.hash_ty != EcdsaSighashType::NonePlusAnyoneCanPay {
+                            spendable = false;
                         }
                     }
                 }
             }
-
-            // if all_acp_sigs > 0 && all_acp_sigs == all_sigs {
-            if all_acp_sigs > 0 {
-                all_acp_txs += 1;
-                let line = format!(
-                    "{}: tx {} contains {} ALL | ACP signatures ({} inputs)",
-                    timestamp,
-                    tx.txid(),
-                    all_acp_sigs,
-                    tx.input.len()
-                );
-                if can_erase {
-                    erase_line();
-                }
-                println!("{}", line);
-                can_erase = false;
-                let _ = file.write_all(line.as_bytes());
+            if spendable {
+                inp_spendable += 1;
             }
         }
+
+        // if all_acp_sigs > 0 && all_acp_sigs == all_sigs {
+        if inp_spendable > 0 {
+            // all_acp_txs += 1;
+            let line = format!(
+                "{}:{}:{}:{}/{}",
+                height,
+                timestamp,
+                tx.txid(),
+                inp_spendable,
+                tx.input.len()
+            );
+            output.push(line);
+            // let _ = file.write_all(line.as_bytes());
+        }
     }
+    output
 }

@@ -3,13 +3,15 @@
 mod cli;
 mod errors;
 
-use bitcoin::{ecdsa, Amount, Block, EcdsaSighashType};
+use bitcoin::script::{self, Instruction};
+use bitcoin::{ecdsa, Amount, Block, BlockHash, EcdsaSighashType, Transaction, Txid};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::Parser as _;
 use cli::Cli;
 use errors::Error;
 use miniscript::bitcoin::{amount, taproot, TapSighashType};
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self};
 use std::time::Duration;
@@ -153,7 +155,7 @@ fn start_runner(
                 match resp {
                     Request::Run(block_height) => {
                         let block = runner.fetch_block(block_height).unwrap();
-                        let res = process_block(block, block_height);
+                        let res = process_block(block, block_height, &runner);
                         sender.send(Response::Finished(runner_id, res)).unwrap();
                     }
                     Request::Height(_) => {}
@@ -224,6 +226,26 @@ impl BlockRunner {
         }
     }
 
+    fn get_block_hash(&self, block_height: u64) -> Result<BlockHash, Error> {
+        match self.rpc.get_block_hash(block_height) {
+            Ok(h) => Ok(h),
+            Err(e) => {
+                println!("Fail to get block hash at height {}: {}", block_height, e);
+                Err(Error::GetBlockHashFails)
+            }
+        }
+    }
+
+    fn fetch_tx(&self, txid: &Txid) -> Result<Transaction, Error> {
+        match self.rpc.get_raw_transaction(txid, None) {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                println!("Fail to get transaction {} : {}", txid, e);
+                Err(Error::GetRawTransactionFails)
+            }
+        }
+    }
+
     fn next(&mut self) -> Block {
         while self.chain_height < self.fetch_block_height {
             // erase_line();
@@ -273,52 +295,102 @@ fn main() {
     pool.start();
 }
 
-fn process_block(block: Block, height: u64) -> Vec<String> {
+fn instruction_to_sig(i: Result<Instruction, script::Error>) -> Option<ecdsa::Signature> {
+    match i {
+        Ok(i) => match i {
+            bitcoin::script::Instruction::PushBytes(elmt) => {
+                if elmt.len() >= 70 && elmt.len() <= 72 && elmt.as_bytes()[0] == 0x30 {
+                    ecdsa::Signature::from_slice(elmt.as_bytes()).ok()
+                } else {
+                    None
+                }
+            }
+            bitcoin::script::Instruction::Op(opcode) => None,
+        },
+        Err(_) => todo!(),
+    }
+}
+
+fn ecdsa_sig(sig: ecdsa::Signature) -> bool {
+    // if sig.hash_ty == EcdsaSighashType::AllPlusAnyoneCanPay
+    // || sig.hash_ty == EcdsaSighashType::SinglePlusAnyoneCanPay
+    // || sig.hash_ty == EcdsaSighashType::NonePlusAnyoneCanPay
+    sig.hash_ty == EcdsaSighashType::NonePlusAnyoneCanPay
+}
+
+fn taproot_sig(sig: taproot::Signature) -> bool {
+    // if tap_sig.sighash_type == TapSighashType::AllPlusAnyoneCanPay
+    // || tap_sig.sighash_type == TapSighashType::SinglePlusAnyoneCanPay
+    // || tap_sig.sighash_type == TapSighashType::NonePlusAnyoneCanPay
+    sig.sighash_type == TapSighashType::NonePlusAnyoneCanPay
+}
+
+fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String> {
     let mut output = Vec::<String>::new();
     let timestamp = block.header.time;
+    let coinbase =
+        Txid::from_str("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
 
+    let mut cb = true;
     for tx in block.txdata {
+        if cb {
+            cb = false;
+            continue;
+        }
         let mut inp_spendable = 0usize;
+        let mut spendable_amount = Amount::ZERO;
         for inp in &tx.input {
-            let mut spendable = true;
-            for elmt in inp.witness.into_iter() {
-                if elmt.len() == 64 || elmt.len() == 65 {
-                    // possibly taproot sig
-                    if let Ok(tap_sig) = taproot::Signature::from_slice(elmt) {
-                        // if tap_sig.sighash_type == TapSighashType::AllPlusAnyoneCanPay
-                        // || tap_sig.sighash_type == TapSighashType::SinglePlusAnyoneCanPay
-                        // || tap_sig.sighash_type == TapSighashType::NonePlusAnyoneCanPay
-                        if tap_sig.sighash_type != TapSighashType::NonePlusAnyoneCanPay {
-                            spendable = false;
-                        }
+            let mut sighashes = Vec::<bool>::new();
+
+            let legacy = inp.witness.is_empty() && !inp.script_sig.is_empty();
+            let wrapped = !inp.witness.is_empty() && !inp.script_sig.is_empty();
+            let segwit = !inp.witness.is_empty() && inp.script_sig.is_empty();
+
+            if legacy {
+                for inst in inp.script_sig.instructions() {
+                    if let Some(sig) = instruction_to_sig(inst) {
+                        sighashes.push(ecdsa_sig(sig));
                     }
-                } else if elmt.len() >= 70 && elmt.len() <= 72 && elmt[0] == 0x30 {
-                    // possibly ecdsa sig
-                    if let Ok(sig) = ecdsa::Signature::from_slice(elmt) {
-                        // if sig.hash_ty == EcdsaSighashType::AllPlusAnyoneCanPay
-                        // || sig.hash_ty == EcdsaSighashType::SinglePlusAnyoneCanPay
-                        // || sig.hash_ty == EcdsaSighashType::NonePlusAnyoneCanPay
-                        if sig.hash_ty != EcdsaSighashType::NonePlusAnyoneCanPay {
-                            spendable = false;
+                }
+            } else if wrapped || segwit {
+                let segwit_v0 = inp.witness[0] == [0x00u8]; // V0
+                let taproot = inp.witness[0] == [0x51u8]; // V1
+
+                for elmt in inp.witness.into_iter() {
+                    if (elmt.len() == 64 || elmt.len() == 65) {
+                        if let Ok(sig) = taproot::Signature::from_slice(elmt) {
+                            sighashes.push(taproot_sig(sig));
+                        }
+                    } else if (elmt.len() >= 70 && elmt.len() <= 72 && elmt[0] == 0x30) {
+                        if let Ok(sig) = ecdsa::Signature::from_slice(elmt) {
+                            sighashes.push(ecdsa_sig(sig));
                         }
                     }
                 }
             }
+
+            let spendable = sighashes.iter().all(|s| *s) && !sighashes.is_empty();
             if spendable {
                 inp_spendable += 1;
+                let outpoint = inp.previous_output;
+                if outpoint.txid != coinbase {
+                    let funding_tx = runner.fetch_tx(&outpoint.txid).unwrap();
+                    spendable_amount += funding_tx.output[outpoint.vout as usize].value;
+                }
             }
         }
 
-        // if all_acp_sigs > 0 && all_acp_sigs == all_sigs {
+        let total = tx.output.iter().fold(0.0, |a, b| a + b.value.to_btc());
         if inp_spendable > 0 {
             // all_acp_txs += 1;
             let line = format!(
-                "{}:{}:{}:{}/{}",
+                "{}:{}:{}:{}/{}:{}",
                 height,
                 timestamp,
                 tx.txid(),
                 inp_spendable,
-                tx.input.len()
+                tx.input.len(),
+                spendable_amount.to_btc()
             );
             output.push(line);
             // let _ = file.write_all(line.as_bytes());

@@ -8,6 +8,8 @@ pub enum Error {
     GetHashFail,
     GetBlockFail,
     GetFirstBlockFail,
+    GetBlockHashFails,
+    GetRawTransactionFails,
     WrongDustLimit,
     CannotConvertScriptToAddress,
     NextBlockNotAvailable,

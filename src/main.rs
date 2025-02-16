@@ -384,7 +384,7 @@ fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String>
             || !(tx.input.len() == 2
                 && tx.output.len() == 3
                 && inputs.len() == 1
-                && tx.output[0].value == Amount::from_sat(600));
+                && tx.output[0].value < Amount::from_sat(5000));
 
         if cont {
             continue;
@@ -397,13 +397,14 @@ fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String>
         };
 
         let line = format!(
-            "{}:{}:{}:{}/{}:{}",
+            "{}:{}:{}:{}/{}:{} => {}",
             height,
             timestamp,
             tx.txid(),
             inputs.len(),
             tx.input.len(),
             inputs_repr,
+            tx.output[0].value
         );
         output.push(line);
         // let _ = file.write_all(line.as_bytes());

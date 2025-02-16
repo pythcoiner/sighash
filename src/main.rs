@@ -374,25 +374,32 @@ fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String>
             // }
         }
 
+        let mut cont = false;
+        cont = cont || inputs.is_empty();
+        cont = cont || tx.input.len() < 2;
+        cont = cont || !(tx.input.len() == 2 && tx.output.len() == 3);
+
+        if cont {
+            continue;
+        }
+
         let inputs_repr = if inputs.len() > 10 {
             "[.........]".to_string()
         } else {
             format!("{:?}", inputs)
         };
-        if !inputs.is_empty() && tx.input.len() > 1 {
-            // all_acp_txs += 1;
-            let line = format!(
-                "{}:{}:{}:{}/{}:{:?}",
-                height,
-                timestamp,
-                tx.txid(),
-                inputs.len(),
-                tx.input.len(),
-                inputs_repr,
-            );
-            output.push(line);
-            // let _ = file.write_all(line.as_bytes());
-        }
+
+        let line = format!(
+            "{}:{}:{}:{}/{}:{}",
+            height,
+            timestamp,
+            tx.txid(),
+            inputs.len(),
+            tx.input.len(),
+            inputs_repr,
+        );
+        output.push(line);
+        // let _ = file.write_all(line.as_bytes());
     }
     output
 }

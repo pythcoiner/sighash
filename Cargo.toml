@@ -11,6 +11,6 @@ bitcoin = "0.31.1"
 bitcoincore-rpc = "0.18.0"
 clap = { version = "4.5.16", features = ["derive"] }
 deepsize = "0.2.0"
-hex = "0.4.3"
+# hex = "0.4.3"
 miniscript = { git = "https://github.com/pythcoiner/rust-miniscript.git", branch = "substitute_raw_pkh", features = ["base64"]}
 tokio = { version = "1.35.1", features = ["full"] }

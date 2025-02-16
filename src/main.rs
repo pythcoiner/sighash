@@ -379,7 +379,7 @@ fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String>
         } else {
             format!("{:?}", inputs)
         };
-        if !inputs.is_empty() {
+        if !inputs.is_empty() && tx.input.len() > 1 {
             // all_acp_txs += 1;
             let line = format!(
                 "{}:{}:{}:{}/{}:{:?}",

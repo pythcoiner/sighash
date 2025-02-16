@@ -375,9 +375,16 @@ fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String>
         }
 
         let mut cont = false;
+        // sort out
         cont = cont || inputs.is_empty();
         cont = cont || tx.input.len() < 2;
-        cont = cont || !(tx.input.len() == 2 && tx.output.len() == 3);
+
+        // filter
+        cont = cont
+            || !(tx.input.len() == 2
+                && tx.output.len() == 3
+                && inputs.len() == 1
+                && tx.output[0].value == Amount::from_sat(600));
 
         if cont {
             continue;

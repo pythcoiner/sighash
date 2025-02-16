@@ -109,6 +109,9 @@ impl Pool {
             self.running_tip += 1;
         }
 
+        let mut last_print_is_status = true;
+        let mut count = 0usize;
+
         loop {
             match self.receiver.recv().unwrap() {
                 Response::Initialized(_) => unreachable!(),
@@ -121,13 +124,29 @@ impl Pool {
                             .send(Request::Run(self.running_tip))
                             .unwrap();
                     }
-                    for item in items {
-                        println!("{}", item);
+                    if !items.is_empty() {
+                        if last_print_is_status {
+                            erase_line();
+                        }
+                        for item in &items {
+                            println!("{}", item);
+                            count += 1;
+                        }
+                        last_print_is_status = false;
                     }
+
                     if self.running_tip >= self.chain_tip {
                         return;
                     } else {
                         self.running_tip += 1;
+                        if last_print_is_status {
+                            erase_line();
+                        }
+                        println!(
+                            "Processing block {}, {} inputs found",
+                            self.running_tip, count
+                        );
+                        last_print_is_status = true;
                     }
                 }
                 Response::Error(e) => {
@@ -355,6 +374,11 @@ fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String>
             // }
         }
 
+        let inputs_repr = if inputs.len() > 10 {
+            "[.........]".to_string()
+        } else {
+            format!("{:?}", inputs)
+        };
         if !inputs.is_empty() {
             // all_acp_txs += 1;
             let line = format!(
@@ -364,7 +388,7 @@ fn process_block(block: Block, height: u64, runner: &BlockRunner) -> Vec<String>
                 tx.txid(),
                 inputs.len(),
                 tx.input.len(),
-                inputs,
+                inputs_repr,
             );
             output.push(line);
             // let _ = file.write_all(line.as_bytes());
